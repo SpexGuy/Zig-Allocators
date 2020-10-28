@@ -1,5 +1,6 @@
 // packages
 const std = @import("std");
+const page_alloc = @import("page_alloc.zig");
 
 // modules
 const builtin = std.builtin;
@@ -15,8 +16,35 @@ const assert = debug.assert;
 // types
 const Mutex = std.Mutex;
 
-// constants
+// constants"
 const page_size = mem.page_size;
+
+pub const Error = error{OutOfMemory};
+
+/// A page-aligned pointer to a chunk of `size` bytes
+pub fn ChunkPointer(comptime size: usize) type {
+    return *align(page_size) [size]u8;
+}
+
+/// A trait to determine if a type is a chunk allocator.
+/// Chunk allocators must support the following decls:
+///   T.chunk_size: const usize
+///   T.allocChunk: const fn(*T) Error!ChunkPointer(T.chunk_size)
+///   T.freeChunk: const fn(*T, [*]u8) void
+pub fn isChunkAllocator(comptime T: type) bool {
+    comptime {
+        return @hasDecl(T, "chunk_size") and
+            @TypeOf(T.chunk_size) == usize and
+            @hasDecl(T, "allocChunk") and
+            @TypeOf(T.allocChunk) == fn (*T) Error!ChunkPointer(T.chunk_size) and
+            @hasDecl(T, "freeChunk") and
+            @TypeOf(T.freeChunk) == fn (*T, [*]u8) void;
+    }
+}
+
+/// Linked list data format for the free list of chunks.
+/// Chunks in the free list can be reinterpreted as this.
+pub const ChunkHeader = struct { next: ?*ChunkHeader };
 
 /// An allocator that allocates large chunks from the operating system.
 /// If the chunk size is smaller than the OS memory map granularity,
@@ -26,17 +54,11 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
     if (!math.isPowerOfTwo(in_chunk_size)) @compileError("Chunk size must be a power of two");
     if (in_chunk_size < page_size) @compileError("Chunk size must be greater than or equal to page size");
     return struct {
-        pub const Error = error{OutOfMemory};
-
         /// The size of a chunk.  All chunks are exactly this size, with no waste.
         pub const chunk_size = in_chunk_size;
 
         /// A pointer to a data chunk of constant size
-        pub const ChunkPtr = *align(page_size) [chunk_size]u8;
-
-        /// Linked list data format for the free list of chunks.
-        /// Chunks in the free list can be reinterpreted as this.
-        const ChunkHeader = struct { next: ?ChunkPtr };
+        pub const ChunkPtr = ChunkPointer(chunk_size);
 
         /// The granularity of direct allocation, as reported by the OS.
         /// This may be larger or smaller than the chunk size.
@@ -59,14 +81,14 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
         /// The head of a free list of chunks.
         /// Reinterpret chunks as ChunkHeader to follow list.
         /// protected by lock
-        first_free_chunk: ?ChunkPtr,
+        first_free_chunk: ?*ChunkHeader,
 
         /// Initialize a chunk allocator.  Queries the OS to get allocation granularity.
         /// This allocator is meant to be global and everlasting.  It cannot release
         /// virtual address space.  Once initialized, this allocator cannot be disposed.
         pub fn init() @This() {
             return @This(){
-                .allocation_granularity_bytes = findAllocationGranularity(),
+                .allocation_granularity_bytes = page_alloc.findAllocationGranularity(),
                 .lock = Mutex.init(),
                 .total_in_use_bytes = 0,
                 .total_free_list_bytes = 0,
@@ -83,28 +105,28 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
             const granule_size = math.max(self.allocation_granularity_bytes, chunk_size);
             const actual_bytes = math.max(num_bytes, granule_size);
 
-            var new_tail_chunk: ?ChunkPtr = null;
-            var new_head_chunk: ?ChunkPtr = null;
+            var new_tail_chunk: ?*ChunkHeader = null;
+            var new_head_chunk: ?*ChunkHeader = null;
             var remaining_bytes = actual_bytes;
             var allocation_size = actual_bytes;
 
             // Try to allocate the requested amount.  If an allocation fails,
             // try to make multiple smaller allocations.
             while (remaining_bytes > 0 and allocation_size >= granule_size) {
-                if (mapChunksDirect(allocation_size)) |new_bytes| {
+                if (page_alloc.alloc(allocation_size)) |new_bytes| {
                     // link the chunks together in the new allocation
-                    const head = @ptrCast(ChunkPtr, new_bytes);
+                    const head = @ptrCast(*ChunkHeader, new_bytes);
                     var tail = head;
                     var offset = chunk_size;
                     while (offset < allocation_size) : (offset += chunk_size) {
-                        const next_tail = @ptrCast(ChunkPtr, @alignCast(page_size, new_bytes + offset));
-                        @ptrCast(*ChunkHeader, tail).next = next_tail;
+                        const next_tail = @ptrCast(*ChunkHeader, @alignCast(page_size, new_bytes + offset));
+                        tail.next = next_tail;
                         tail = next_tail;
                     }
 
                     // link into the larger list
-                    @ptrCast(*ChunkHeader, tail).next = new_tail_chunk;
                     if (new_tail_chunk == null) new_tail_chunk = tail;
+                    tail.next = new_head_chunk;
                     new_head_chunk = head;
 
                     remaining_bytes -= allocation_size;
@@ -120,7 +142,7 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
                 defer locked.release();
 
                 // link
-                @ptrCast(*ChunkHeader, tail).next = self.first_free_chunk;
+                tail.next = self.first_free_chunk;
                 self.first_free_chunk = new_head_chunk;
 
                 // update stats
@@ -153,9 +175,8 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
                     self.total_free_list_bytes -= chunk_size;
 
                     // return a free chunk
-                    const header = @ptrCast(*ChunkHeader, chunk);
-                    self.first_free_chunk = header.next;
-                    return chunk;
+                    self.first_free_chunk = chunk.next;
+                    return @intToPtr(ChunkPtr, @ptrToInt(chunk));
                 }
             }
 
@@ -173,9 +194,8 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
                     self.total_free_list_bytes -= chunk_size;
 
                     // return a free chunk
-                    const header = @ptrCast(*ChunkHeader, chunk);
-                    self.first_free_chunk = header.next;
-                    return chunk;
+                    self.first_free_chunk = chunk.next;
+                    return @intToPtr(ChunkPtr, @ptrToInt(chunk));
                 }
 
                 // couldn't get the bytes, unclaim them for stats
@@ -193,17 +213,17 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
                 // must be power of two chunks
                 assert(self.allocation_granularity_bytes >= 2 * chunk_size);
 
-                const new_chunks = try mapChunksDirect(self.allocation_granularity_bytes);
+                const new_chunks = try page_alloc.alloc(self.allocation_granularity_bytes);
                 const first_chunk = @ptrCast(ChunkPtr, new_chunks);
-                const second_chunk = @ptrCast(ChunkPtr, new_chunks + chunk_size);
+                const second_chunk = @ptrCast(*ChunkHeader, @alignCast(page_size, new_chunks + chunk_size));
 
                 // link all chunks starting at the second chunk together.
                 // we don't need the lock because these chunks aren't published.
                 var last_chunk = second_chunk;
                 var offset = chunk_size + chunk_size;
                 while (offset < self.allocation_granularity_bytes) : (offset += chunk_size) {
-                    const next_chunk = @ptrCast(ChunkPtr, @alignCast(page_size, new_chunks + offset));
-                    @ptrCast(*ChunkHeader, last_chunk).next = next_chunk;
+                    const next_chunk = @ptrCast(*ChunkHeader, @alignCast(page_size, new_chunks + offset));
+                    last_chunk.next = next_chunk;
                     last_chunk = next_chunk;
                 }
 
@@ -219,21 +239,21 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
                     // total_in_use_bytes has already been updated by the caller
 
                     // link list
-                    @ptrCast(*ChunkHeader, last_chunk).next = self.first_free_chunk;
+                    last_chunk.next = self.first_free_chunk;
                     self.first_free_chunk = second_chunk;
                 }
 
                 // return the first chunk
                 return first_chunk;
             } else {
-                const new_chunk = try mapChunksDirect(chunk_size);
+                const new_chunk = try page_alloc.alloc(chunk_size);
                 return @ptrCast(ChunkPtr, new_chunk);
             }
         }
 
         /// Returns a chunk to the free list.  This chunk remains committed and available.
         pub fn freeChunk(self: *@This(), chunk_ptr: [*]u8) void {
-            const chunk = @ptrCast(ChunkPtr, @alignCast(page_size, chunk_ptr));
+            const chunk = @ptrCast(*ChunkHeader, @alignCast(page_size, chunk_ptr));
             {
                 const locked = self.lock.acquire();
                 defer locked.release();
@@ -243,76 +263,32 @@ pub fn ThreadsafeChunkAllocator(comptime in_chunk_size: usize) type {
                 self.total_in_use_bytes -= chunk_size;
 
                 // link list
-                @ptrCast(*ChunkHeader, chunk).next = self.first_free_chunk;
+                chunk.next = self.first_free_chunk;
                 self.first_free_chunk = chunk;
             }
         }
+
+        /// Return a bunch of chunks to the free list.
+        pub fn freeChunks(self: *@This(), free_head: *ChunkHeader, free_tail: *ChunkHeader, num_chunks: usize) void {
+            const byte_swing = @as(usize, num_chunks) * chunk_size;
+
+            const locked = self.lock.acquire();
+            defer locked.release();
+
+            free_tail.next = self.first_free_chunk;
+            self.first_free_chunk = free_head;
+
+            self.total_free_list_bytes += byte_swing;
+            self.total_in_use_bytes -= byte_swing;
+        }
     };
-}
-
-/// Queries the allocation granularity from the operating system
-pub fn findAllocationGranularity() usize {
-    if (builtin.os.tag == .windows) {
-        const w = os.windows;
-        var info: w.SYSTEM_INFO = undefined;
-        w.kernel32.GetSystemInfo(&info);
-        assert(math.isPowerOfTwo(info.dwAllocationGranularity));
-        return info.dwAllocationGranularity;
-    } else {
-        return page_size;
-    }
-}
-
-/// Maps a chunk of memory from the OS
-pub fn mapChunksDirect(allocation_size: usize) error{OutOfMemory}![*]align(page_size) u8 {
-    if (builtin.os.tag == .windows) {
-        const w = os.windows;
-
-        const addr = w.VirtualAlloc(
-            null,
-            allocation_size,
-            w.MEM_COMMIT | w.MEM_RESERVE,
-            w.PAGE_READWRITE,
-        ) catch return error.OutOfMemory;
-
-        return @alignCast(page_size, @ptrCast([*]u8, addr));
-    } else {
-        const slice = os.mmap(
-            null,
-            allocation_size,
-            os.PROT_READ | os.PROT_WRITE,
-            os.MAP_PRIVATE | os.MAP_ANONYMOUS,
-            -1,
-            0,
-        ) catch return error.OutOfMemory;
-
-        return slice.ptr;
-    }
-}
-
-test "Get Granularity" {
-    const granularity = findAllocationGranularity();
-    if (builtin.os.tag == .windows) {
-        testing.expectEqual(@as(usize, 64 * 1024), granularity);
-    } else {
-        testing.expectEqual(@as(usize, os.page_size), granularity);
-    }
-}
-
-test "Map Chunk" {
-    const granularity = findAllocationGranularity();
-    const chunk = try mapChunksDirect(granularity);
-    const slice = chunk[0..granularity];
-    mem.set(u8, slice, 0xF8);
-    for (slice) |item| {
-        assert(item == 0xF8);
-    }
 }
 
 test "Lazy Allocator" {
     const chunk_size: usize = 16 * 1024;
 
     var allocator = ThreadsafeChunkAllocator(chunk_size).init();
+    testing.expect(isChunkAllocator(@TypeOf(allocator)));
     testing.expectEqual(@as(usize, 0), allocator.total_free_list_bytes);
     testing.expectEqual(@as(usize, 0), allocator.total_in_use_bytes);
 
